@@ -107,6 +107,15 @@ h1,#score,#cardName,#grade,#alert,.btn,.row b,#stageName{font-weight:800}
 #advance.on{opacity:.85;animation:breathe 1.6s infinite}
 @keyframes breathe{50%{opacity:.28}}
 
+/* ---------- flank warning ---------- */
+.flank{position:absolute;top:50%;transform:translateY(-50%);font-size:34px;line-height:1;
+  color:var(--rust);opacity:0;transition:opacity .18s;
+  text-shadow:0 0 18px rgba(168,72,44,.9);pointer-events:none}
+.flank.on{opacity:.95;animation:nudge .7s infinite}
+#flankL{left:10px}
+#flankR{right:10px}
+@keyframes nudge{50%{opacity:.35}}
+
 /* ---------- boss bar ---------- */
 #bossBar{position:absolute;top:74px;left:50%;transform:translateX(-50%);width:min(72vw,460px);
   opacity:0;transition:opacity .35s}
@@ -193,6 +202,8 @@ h1 span{display:block;color:var(--rust);font-size:.34em;letter-spacing:.26em;mar
   </div>
 
   <div id="xh"><i></i><i></i><i></i><i></i></div>
+  <div id="flankL" class="flank">&#9664;</div>
+  <div id="flankR" class="flank">&#9654;</div>
   <div id="dmgTop"></div>
   <div id="alert"></div>
   <div id="advance">ADVANCING</div>
@@ -252,6 +263,7 @@ const D = {
   hurt:$('#hurt'), vig:$('#vig'), pops:$('#dmgTop'), alert:$('#alert'), advance:$('#advance'),
   bossBar:$('#bossBar'), bossName:$('#bossName'), bossFill:$('#bossFill'), bossHint:$('#bossHint'),
   card:$('#card'), cardNo:$('#cardNo'), cardName:$('#cardName'), cardSub:$('#cardSub'),
+  flankL:$('#flankL'), flankR:$('#flankR'),
   title:$('#title'), over:$('#over'), overTag:$('#overTag'), overTitle:$('#overTitle'),
   grade:$('#grade'), overRows:$('#overRows')
 };
@@ -558,6 +570,7 @@ function clearStage(){
   if(stageRoot){ scene.remove(stageRoot); disposeTree(stageRoot); }
   stageRoot = new THREE.Group(); scene.add(stageRoot);
   hittables.length = 0;
+  SPLATS.length = 0; GIBS.length = 0;
   G.enemies.forEach(e=>e.group.parent&&e.group.parent.remove(e.group));
   G.enemies.length=0; G.shots3d.length=0; G.parts.length=0; G.boss=null;
 }
@@ -786,8 +799,99 @@ function pickClear(S,min){
 }
 
 /* ================================================================
-   7. ENEMIES
+   6b. VIEW CONE — nothing can hurt the player from outside it
 ================================================================ */
+const _fw = new THREE.Vector3(), _cp = new THREE.Vector3(), _to = new THREE.Vector3();
+function activeCam(){
+  if(XR.active){ try{ return renderer.xr.getCamera(camera); }catch(e){ return camera; } }
+  return camera;
+}
+/* half-angle of the horizontal view, clamped so portrait phones aren't punishing */
+function viewCos(){
+  if(XR.active) return Math.cos(0.95);              /* ~54 deg each side */
+  const vh = camera.fov*Math.PI/360;
+  let hh = Math.atan(Math.tan(vh)*camera.aspect);
+  hh = Math.max(0.72, Math.min(1.15, hh));           /* 41 .. 66 deg */
+  return Math.cos(hh);
+}
+function camForward(out){
+  activeCam().getWorldDirection(out); out.y=0;
+  if(out.lengthSq()<1e-6) out.set(0,0,-1);
+  return out.normalize();
+}
+function camPos(out){ activeCam().getWorldPosition(out); return out; }
+/* signed: >0 means p is inside the cone. also reports which side it's on. */
+function coneDot(p){
+  camForward(_fw); camPos(_cp);
+  _to.copy(p).sub(_cp); _to.y=0;
+  if(_to.lengthSq()<1e-6) return {d:1, side:0};
+  _to.normalize();
+  const d = _to.dot(_fw);
+  const side = (_fw.x*_to.z - _fw.z*_to.x) > 0 ? -1 : 1;
+  return {d:d, side:side};
+}
+function inFront(p){ return coneDot(p).d >= viewCos(); }
+
+/* ================================================================
+   7. ENEMIES + GORE
+================================================================ */
+const BLOOD = 0x8c0f0a, BLOOD_D = 0x40060a, VISC = 0x6e1c17, BONE = 0xcfc4a8;
+
+/* persistent floor splatter, FIFO capped */
+const SPLATS = [], SPLAT_MAX = 80;
+function addSplat(x, z, r, dark){
+  const m = new THREE.Mesh(PLNG, basic(dark?0x270604:0x4d0b09,
+    {transparent:true, opacity:.62, depthWrite:false}));
+  m.rotation.x = -Math.PI/2; m.rotation.z = Math.random()*6;
+  m.position.set(x, .032+Math.random()*.016, z);
+  m.scale.set(r*(.7+Math.random()*.7), r*(.7+Math.random()*.7), 1);
+  m.raycast = function(){};
+  stageRoot.add(m); SPLATS.push(m);
+  if(SPLATS.length > SPLAT_MAX){ const o = SPLATS.shift(); if(o.parent) o.parent.remove(o); }
+}
+/* directional arterial spray */
+function gush(p, dir, n, color){
+  const c = color===undefined ? BLOOD : color;
+  for(let i=0;i<n;i++){
+    let m = PPOOL.pop();
+    if(!m){ m = new THREE.Mesh(BOXG, basic(0xffffff)); m.raycast=function(){}; }
+    m.material = basic(Math.random()<.35 ? BLOOD_D : c);
+    m.scale.set(.04+Math.random()*.06, .04+Math.random()*.06, .10+Math.random()*.22);
+    m.position.copy(p); m.visible = true;
+    stageRoot.add(m);
+    const v = new THREE.Vector3(
+      (Math.random()-.5)*3.2, 1.2+Math.random()*3.4, (Math.random()-.5)*3.2);
+    if(dir) v.addScaledVector(dir, 2.4+Math.random()*4.2);
+    G.parts.push({m:m, v:v, life:.6+Math.random()*.7, t:0,
+      rv:(Math.random()-.5)*16, wet:true});
+  }
+}
+/* heavy chunks that fall and stay put */
+const GIBS = [], GIB_MAX = 26;
+function gib(mesh, worldPos, vel){
+  mesh.position.copy(worldPos);
+  mesh.raycast = function(){};
+  stageRoot.add(mesh);
+  GIBS.push({m:mesh, v:vel, rv:new THREE.Vector3(
+    (Math.random()-.5)*11,(Math.random()-.5)*11,(Math.random()-.5)*11), rest:false});
+  if(GIBS.length > GIB_MAX){ const o = GIBS.shift(); if(o.m.parent) o.m.parent.remove(o.m); }
+}
+function updateGibs(dt){
+  for(let i=0;i<GIBS.length;i++){
+    const g = GIBS[i];
+    if(g.rest) continue;
+    g.v.y -= 13*dt;
+    g.m.position.addScaledVector(g.v, dt);
+    g.m.rotation.x += g.rv.x*dt; g.m.rotation.y += g.rv.y*dt; g.m.rotation.z += g.rv.z*dt;
+    if(g.m.position.y <= .1){
+      g.m.position.y = .1; g.rest = true;
+      g.m.rotation.set(Math.random()*.4, Math.random()*6, Math.PI/2+(Math.random()-.5)*.5);
+      addSplat(g.m.position.x, g.m.position.z, .5, false);
+    }
+  }
+}
+
+
 const ETYPE = {
   sh:{ name:'shambler', hp:34, speed:1.25, reach:2.1, dmg:1, scale:1.0,
        skin:0x8a9c7a, cloth:0x3f4a3a, wind:.85, score:120 },
@@ -802,17 +906,62 @@ const ETYPE = {
 function makeBody(t){
   const g = new THREE.Group();
   const S = ETYPE[t], skin=S.skin, cloth=S.cloth;
+  const gore = (Math.random()*4)|0;      /* mutilation preset */
+  const F = .18;                          /* +Z is the face — they walk toward you along +Z */
+
   const torso = box(.62,.76,.34,cloth); torso.position.y=1.16; torso.userData.part='body'; g.add(torso);
   const belly = box(.56,.3,.32, S.boom?0x7d8a3e:cloth); belly.position.y=.76;
   belly.userData.part='body'; g.add(belly);
   if(S.boom){ const sac = sph(.42,0x9fae4a,{emissive:0x2a3308});
     sac.position.set(0,1.05,.16); sac.userData.part='body'; g.add(sac); }
+
+  /* opened chest — cavity, wet organ, splayed ribs */
+  if(gore===0 || gore===2 || S.boom){
+    const cav = box(.42,.46,.07,0x210403); cav.position.set(0,1.22,F);
+    cav.userData.part='body'; g.add(cav);
+    const org = box(.28,.24,.13,VISC); org.position.set(0,1.19,F+.05);
+    org.userData.part='body'; g.add(org);
+    for(let i=0;i<4;i++){
+      const rib = box(.42,.038,.07,BONE);
+      rib.position.set(0, 1.02+i*.13, F+.035);
+      rib.rotation.z = (Math.random()-.5)*.24;
+      rib.userData.part='body'; g.add(rib);
+    }
+  }
+  /* spilled entrails, swing while walking */
+  let entrails = null;
+  if(gore===1 || gore===2){
+    entrails = new THREE.Group();
+    entrails.position.set((Math.random()-.5)*.22, .88, F-.03);
+    let py = 0;
+    for(let i=0;i<4;i++){
+      const seg = box(.17-i*.022, .21, .17-i*.022, i%2 ? VISC : 0x7d2420);
+      seg.position.y = py-.105; seg.userData.part='body'; entrails.add(seg);
+      py -= .2;
+    }
+    g.add(entrails);
+  }
+  /* dried runs down the front */
+  const streaks = 1+((Math.random()*3)|0);
+  for(let i=0;i<streaks;i++){
+    const h = .3+Math.random()*.55;
+    const st = box(.06+Math.random()*.08, h, .02, Math.random()<.5?BLOOD_D:BLOOD);
+    st.position.set((Math.random()-.5)*.44, 1.32-h/2-Math.random()*.28, F+.005);
+    st.userData.part='body'; g.add(st);
+  }
+
   const head = box(.33,.37,.31,skin); head.position.y=1.66; head.userData.part='head'; g.add(head);
   const jaw = box(.26,.1,.26,0x6b4a44); jaw.position.set(0,1.5,.04);
   jaw.userData.part='head'; g.add(jaw);
-  /* eyes read even in fog */
+  if(gore===3){ jaw.position.set(0,1.42,.1); jaw.rotation.x=.6; }   /* unhinged */
+  /* face wound + throat gash */
+  const fw = box(.15,.17,.035,BLOOD);
+  fw.position.set((Math.random()-.5)*.15, 1.63, .175); fw.userData.part='head'; g.add(fw);
+  const ng = box(.23,.08,.07,BLOOD_D);
+  ng.position.set(0,1.45,.14); ng.userData.part='head'; g.add(ng);
+  /* eyes — FRONT of the head (+Z) */
   const eL = new THREE.Mesh(BOXG, basic(S.ranged?0xb6ff5a:0xffd06a));
-  eL.scale.set(.06,.05,.02); eL.position.set(-.08,1.7,-.16); eL.raycast=function(){};
+  eL.scale.set(.06,.05,.02); eL.position.set(-.08,1.71,.17); eL.raycast=function(){};
   const eR = eL.clone(); eR.position.x=.08; g.add(eL); g.add(eR);
   g.userData.eyes=[eL,eR];
 
@@ -826,11 +975,21 @@ function makeBody(t){
   const lL = limb(.185,.66,.2,cloth,-.16,.62,0,'leg');
   const lR = limb(.185,.66,.2,cloth, .16,.62,0,'leg');
   aL.rotation.x=-1.15; aR.rotation.x=-1.15;
-  g.userData.rig={aL,aR,lL,lR,torso,head};
+  g.userData.rig={aL,aR,lL,lR,torso,head,jaw,entrails};
   g.scale.setScalar(S.scale);
   outlineAll(g,.05);
   const bl = blob(.45*S.scale); g.add(bl);
   return g;
+}
+/* stump + tendons left where a limb tore off */
+function stumpAt(pivot, scale){
+  const s = box(.18,.12,.18,VISC); s.position.y=-.06;
+  s.userData.noOutline=true; s.raycast=function(){}; pivot.add(s);
+  for(let i=0;i<2;i++){
+    const tn = box(.035,.22+Math.random()*.18,.035,0x7d2420);
+    tn.position.set((Math.random()-.5)*.12, -.2, (Math.random()-.5)*.12);
+    tn.userData.noOutline=true; tn.raycast=function(){}; pivot.add(tn);
+  }
 }
 
 class Enemy {
@@ -842,39 +1001,88 @@ class Enemy {
     this.group.userData.enemy = this;
     this.dead=false; this.deadT=0; this.phase=Math.random()*7;
     this.state='walk'; this.st=0; this.armless=0;
+    this.wounds=0; this.dripT=.6+Math.random();
+    this.flankSide = Math.random()<.5 ? -1 : 1;
     this.spitCd = 1.5 + Math.random()*2;
     stageRoot.add(this.group);
     hittables.push(this.group);
     if(Math.random()<.6) A.groan();
   }
   headPos(){ const v=new THREE.Vector3(0,1.66*this.S.scale,0); return v.add(this.group.position); }
-  hurt(dmg, part){
+  wound(worldPoint){
+    if(!worldPoint || this.wounds>=7) return;
+    this.wounds++;
+    const lp = this.group.worldToLocal(worldPoint.clone());
+    const out = new THREE.Vector3(lp.x,0,lp.z);
+    if(out.lengthSq()>1e-5) lp.add(out.normalize().multiplyScalar(.035));
+    const w = box(.09+Math.random()*.11, .09+Math.random()*.11, .05,
+      Math.random()<.5 ? BLOOD : BLOOD_D);
+    w.position.copy(lp); w.rotation.set(Math.random()*3,Math.random()*3,Math.random()*3);
+    w.userData.noOutline=true; w.raycast=function(){};
+    this.group.add(w);
+  }
+  hurt(dmg, part, worldPoint){
     if(this.dead) return;
     this.hp -= dmg;
-    this.state==='rise' && (this.state='walk');
+    if(this.state==='rise') this.state='walk';
+    this.wound(worldPoint);
     if(part==='arm' && this.armless<2 && Math.random()<.35){
       const r=this.group.userData.rig;
       const arm = this.armless===0?r.aL:r.aR;
-      arm.visible=false; this.armless++;
-      burst(this.headPos().setY(this.group.position.y+1.4*this.S.scale), 0x5d1410, 8);
+      const wp = arm.getWorldPosition(new THREE.Vector3());
+      arm.children.forEach(c=>{ c.visible=false; });
+      stumpAt(arm, this.S.scale);
+      this.armless++;
+      gush(wp, null, 12);
+      const chunk = box(.15,.55,.15,this.S.skin);
+      gib(chunk, wp, new THREE.Vector3((Math.random()-.5)*4, 3.4, (Math.random()-.5)*4));
+      A.hit();
     }
-    if(this.hp<=0) this.kill(part==='head');
+    if(this.hp<=0) this.kill(part==='head', worldPoint);
   }
-  kill(head){
+  kill(head, worldPoint){
     this.dead=true; this.deadT=0;
+    const g = this.group, sc = this.S.scale;
     if(this.S.boom) this.explode();
-    const p = this.group.position.clone(); p.y += 1.2*this.S.scale;
-    burst(p, 0x5d1410, head?22:12);
-    const i = hittables.indexOf(this.group); if(i>=0) hittables.splice(i,1);
+    const chest = g.position.clone().setY(1.2*sc);
+    if(head){
+      const r = g.userData.rig;
+      const wp = r.head.getWorldPosition(new THREE.Vector3());
+      r.head.visible=false; if(r.jaw) r.jaw.visible=false;
+      g.userData.eyes.forEach(e=>e.visible=false);
+      const stump = box(.3,.12,.28,VISC);
+      stump.position.y = 1.5; stump.userData.noOutline=true; stump.raycast=function(){};
+      g.add(stump);
+      for(let i=0;i<3;i++){
+        const sp = box(.03,.14,.03,BONE);
+        sp.position.set((Math.random()-.5)*.2, 1.58, (Math.random()-.5)*.2);
+        sp.userData.noOutline=true; sp.raycast=function(){}; g.add(sp);
+      }
+      gush(wp, new THREE.Vector3(0,1,0), 26);
+      const skull = box(.33,.37,.31,this.S.skin);
+      gib(skull, wp, new THREE.Vector3((Math.random()-.5)*4.5, 4.2, (Math.random()-.5)*4.5));
+      A.head();
+    } else {
+      gush(chest, null, 16);
+    }
+    addSplat(g.position.x, g.position.z, 1.35*sc, false);
+    const i = hittables.indexOf(g); if(i>=0) hittables.splice(i,1);
     A.kill();
     G.kills++;
     addScore(this.S.score * (head?3:1), head);
   }
   explode(){
-    burst(this.group.position.clone().setY(1.1), 0x9fae4a, 30);
+    const p = this.group.position.clone().setY(1.1);
+    gush(p, null, 34, 0x9fae4a);
+    gush(p, null, 20);
+    addSplat(p.x, p.z, 3.2, false);
+    for(let i=0;i<4;i++){
+      const chunk = box(.2+Math.random()*.2,.2,.2+Math.random()*.2, i%2?VISC:this.S.skin);
+      gib(chunk, p, new THREE.Vector3((Math.random()-.5)*8, 3+Math.random()*3, (Math.random()-.5)*8));
+    }
     A.boom(); shake(.6);
-    const d = this.group.position.distanceTo(rig.position);
-    if(d < 6.5) damagePlayer(2);
+    if(inFront(this.group.position) && this.group.position.distanceTo(rig.position) < 6.5)
+      damagePlayer(2);
   }
   update(dt){
     const g=this.group, r=g.userData.rig, S=this.S;
@@ -912,12 +1120,13 @@ class Enemy {
     }
     if(this.state==='wind'){
       this.st+=dt;
+      if(!inFront(g.position)){ this.state='walk'; this.st=0; return; }
       const k = this.st/S.wind;
       r.aL.rotation.x = -1.15 - k*1.5; r.aR.rotation.x = -1.15 - k*1.5;
       if(this.st>=S.wind){
         this.state='swing'; this.st=0;
         if(S.boom){ this.kill(false); return; }
-        if(dist < S.reach+.8) damagePlayer(S.dmg);
+        if(dist < S.reach+.8 && inFront(g.position)) damagePlayer(S.dmg);
         r.aL.rotation.x=-.2; r.aR.rotation.x=-.2;
       }
       return;
@@ -929,6 +1138,7 @@ class Enemy {
     }
     if(this.state==='spit'){
       this.st+=dt;
+      if(!inFront(g.position)){ this.state='walk'; this.st=0; return; }
       r.aL.rotation.x=-2.2; r.aR.rotation.x=-2.2;
       if(this.st>.7){
         spawnSpit(this.headPos(), target.clone());
@@ -938,6 +1148,24 @@ class Enemy {
     }
 
     /* walk */
+    const vis = inFront(g.position);
+    if(!vis){
+      /* outside the view cone: it can't hurt you, so it circles back into it
+         instead of parking at your back and stalling the wave */
+      camForward(_fw); camPos(_cp);
+      const right = new THREE.Vector3(-_fw.z, 0, _fw.x);
+      const tgt = _cp.clone()
+        .addScaledVector(_fw, Math.max(5.5, Math.min(dist, 16)))
+        .addScaledVector(right, 3.4*this.flankSide);
+      const fa = Math.atan2(tgt.x-g.position.x, tgt.z-g.position.z);
+      g.rotation.y = fa;
+      this.approach(dt, fa, S.speed*1.25);
+      const sw2 = Math.sin(this.phase*S.speed*3.4);
+      r.lL.rotation.x = sw2*.7; r.lR.rotation.x = -sw2*.7;
+      r.aL.rotation.x = -1.15 + sw2*.2; r.aR.rotation.x = -1.15 - sw2*.2;
+      if(r.entrails){ r.entrails.rotation.x = sw2*.5; r.entrails.rotation.z = sw2*.3; }
+      return;
+    }
     if(S.ranged){
       this.spitCd -= dt;
       if(dist > 9.5) this.approach(dt,ang,S.speed);
@@ -947,10 +1175,19 @@ class Enemy {
       if(dist > S.reach) this.approach(dt,ang,S.speed);
       else { this.state='wind'; this.st=0; }
     }
+    /* wounded ones leave a trail */
+    if(this.hp < this.maxhp*.7){
+      this.dripT -= dt;
+      if(this.dripT <= 0){
+        addSplat(g.position.x, g.position.z, .3+Math.random()*.25, true);
+        this.dripT = .5+Math.random()*.9;
+      }
+    }
     const sw = Math.sin(this.phase*S.speed*3.1);
     r.lL.rotation.x =  sw*.62; r.lR.rotation.x = -sw*.62;
     r.aL.rotation.x = -1.15 + sw*.18; r.aR.rotation.x = -1.15 - sw*.18;
     r.torso.rotation.z = sw*.05;
+    if(r.entrails){ r.entrails.rotation.x = sw*.42; r.entrails.rotation.z = sw*.26; }
     g.position.y = Math.abs(sw)*.045;
   }
   approach(dt,ang,sp){
@@ -989,7 +1226,11 @@ function updateParts(dt){
     p.v.y -= 11*dt;
     p.m.position.addScaledVector(p.v,dt);
     p.m.rotation.x += p.rv*dt; p.m.rotation.y += p.rv*dt;
-    if(p.m.position.y<.05){ p.m.position.y=.05; p.v.set(0,0,0); }
+    if(p.m.position.y<.05){
+      if(p.wet && !p.landed){ p.landed=true;
+        addSplat(p.m.position.x, p.m.position.z, .28+Math.random()*.3, Math.random()<.5); }
+      p.m.position.y=.05; p.v.set(0,0,0);
+    }
     if(p.t>p.life){
       if(p.m.parent) p.m.parent.remove(p.m);
       p.m.visible=false; PPOOL.push(p.m); G.parts.splice(i,1);
@@ -1004,7 +1245,8 @@ function spawnSpit(from, to){
   stageRoot.add(m); hittables.push(m);
   const dir = to.clone().setY(EYE).sub(from);
   const time = Math.max(.7, dir.length()/13);
-  G.shots3d.push({m, from:from.clone(), to:to.clone().setY(EYE), t:0, dur:time, dmg:1});
+  G.shots3d.push({m, from:from.clone(), to:to.clone().setY(EYE), t:0, dur:time, dmg:1,
+    src:from.clone()});
 }
 function updateShots(dt){
   for(let i=G.shots3d.length-1;i>=0;i--){
@@ -1013,8 +1255,8 @@ function updateShots(dt){
     if(s.dead || k>=1){
       if(!s.dead && k>=1){
         const d = s.m.position.distanceTo(rig.position);
-        if(d<2.6) damagePlayer(s.dmg);
-        burst(s.m.position.clone(), 0xb6ff5a, 10);
+        if(d<2.6 && inFront(s.src || s.m.position)) damagePlayer(s.dmg);
+        gush(s.m.position.clone(), null, 8, 0xb6ff5a);
       }
       if(s.m.parent) s.m.parent.remove(s.m);
       const h=hittables.indexOf(s.m); if(h>=0) hittables.splice(h,1);
@@ -1565,8 +1807,9 @@ function doFire(rc){
       G.hits++; landed = true;
       if(part==='head'){ G.heads++; A.head(); popText(h.point, 'HEADSHOT', true); }
       else A.hit();
-      burst(h.point.clone(), 0x5d1410, part==='head'?10:5);
-      enemy.hurt(dmg, part);
+      const sprayDir = h.point.clone().sub(rig.position).setY(.4).normalize();
+      gush(h.point.clone(), sprayDir, part==='head'?14:7);
+      enemy.hurt(dmg, part, h.point.clone());
       break;
     }
     /* environment: spark and stop */
@@ -1591,8 +1834,10 @@ function updateReload(dt){
     D.xh.classList.remove('dry');
   }
 }
-function damagePlayer(n){
+function damagePlayer(n, srcPos){
   if(G.state!=='play') return;
+  /* backstop: nothing outside the view cone can ever land a hit */
+  if(srcPos && !inFront(srcPos)) return;
   G.hp -= n; G.taken += n; breakCombo();
   A.hurt(); shake(.85);
   D.hurt.style.transition='none'; D.hurt.style.opacity='1';
@@ -1649,6 +1894,22 @@ function flashAlert(t){
   D.alert.classList.remove('on'); void D.alert.offsetWidth; D.alert.classList.add('on');
 }
 function setVig(v){ D.vig.style.opacity = v; if(vrVig) vrVig.userData.target = v*.85; }
+/* tell the player something is circling — otherwise the damage gate reads as a bug */
+function updateFlankWarning(){
+  let L=false, R=false;
+  const cos = viewCos();
+  for(let i=0;i<G.enemies.length;i++){
+    const e = G.enemies[i];
+    if(e.dead) continue;
+    if(e.group.position.distanceTo(rig.position) > 26) continue;
+    const c = coneDot(e.group.position);
+    if(c.d >= cos) continue;
+    if(c.side < 0) L = true; else R = true;
+    if(L && R) break;
+  }
+  D.flankL.classList.toggle('on', L);
+  D.flankR.classList.toggle('on', R);
+}
 function shake(v){ G.shake = Math.max(G.shake, v); }
 let muzzleMesh=null, muzzleT=0;
 function muzzle(){
@@ -1817,6 +2078,8 @@ function tick(){
     }
     updateShots(dt);
     updateParts(dt);
+    updateGibs(dt);
+    updateFlankWarning();
     updateReload(dt);
     if(G.comboT>0){ G.comboT-=dt; if(G.comboT<=0) breakCombo(); }
     /* strobes */
