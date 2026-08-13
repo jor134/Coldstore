@@ -514,6 +514,7 @@ const G = {
   shots:0, hits:0, heads:0, kills:0, taken:0,
   enemies:[], shots3d:[], parts:[], boss:null, props:[],
   curve:null, railT:0, railFrom:0, railTo:0,
+  yaw:0, aimTarget:null, aimHold:0,
   beats:[], bi:0, beat:null, bt:0,
   focus:new THREE.Vector3(), lookQ:new THREE.Quaternion(),
   shake:0, moving:false, t:0, stageStart:0
@@ -836,6 +837,9 @@ function inFront(p){ return coneDot(p).d >= viewCos(); }
    7. ENEMIES + GORE
 ================================================================ */
 const BLOOD = 0x8c0f0a, BLOOD_D = 0x40060a, VISC = 0x6e1c17, BONE = 0xcfc4a8;
+/* flanking enemies hold this radius while circling into view. Small radii are what
+   make the camera whip: bearing rate is speed/radius. */
+const ORBIT_R = 8.5;
 
 /* persistent floor splatter, FIFO capped */
 const SPLATS = [], SPLAT_MAX = 80;
@@ -892,14 +896,23 @@ function updateGibs(dt){
 }
 
 
+/* Nothing may cross this ring. Bearing rate is speed/radius, so a zombie
+   circling at 2m whips the camera far harder than one at 3.5m. Attack reaches
+   below are all set ABOVE this so they still land damage from the ring. */
+const MIN_STANDOFF = 3.4;
+/* Hard cap on how fast anything may sweep across your view, in rad/s.
+   Tangential speed gets clamped to MAX_BEARING * radius. */
+const MAX_BEARING = 0.55;
+const SEPARATION = 1.7;      /* enemies push apart so they don't stack into one point */
+
 const ETYPE = {
-  sh:{ name:'shambler', hp:34, speed:1.25, reach:2.1, dmg:1, scale:1.0,
+  sh:{ name:'shambler', hp:34, speed:1.25, reach:4.3, hold:3.6, dmg:1, scale:1.0,
        skin:0x8a9c7a, cloth:0x3f4a3a, wind:.85, score:120 },
-  ru:{ name:'runner',   hp:24, speed:3.5,  reach:2.0, dmg:1, scale:.94,
+  ru:{ name:'runner',   hp:24, speed:3.5,  reach:4.2, hold:3.5, dmg:1, scale:.94,
        skin:0xa38f78, cloth:0x59322c, wind:.5,  score:180 },
-  sp:{ name:'spitter',  hp:30, speed:1.0,  reach:12,  dmg:1, scale:1.02, ranged:true,
+  sp:{ name:'spitter',  hp:30, speed:1.0,  reach:12,  hold:9.5, dmg:1, scale:1.02, ranged:true,
        skin:0x7d9a6d, cloth:0x2f4b3c, wind:1.1, score:220 },
-  bl:{ name:'bloater',  hp:74, speed:.95,  reach:3.4, dmg:2, scale:1.34, boom:true,
+  bl:{ name:'bloater',  hp:74, speed:.95,  reach:5.2, hold:4.4, dmg:2, scale:1.34, boom:true,
        skin:0x9aa06a, cloth:0x4a4326, wind:.9,  score:280 }
 };
 
@@ -1085,6 +1098,15 @@ class Enemy {
       damagePlayer(2);
   }
   update(dt){
+    const px = this.group.position.x, pz = this.group.position.z;
+    this.step(dt);
+    if(!this.dead){
+      this.separate(dt);
+      this.enforceStandoff();
+      this.capBearing(px, pz, dt);
+    }
+  }
+  step(dt){
     const g=this.group, r=g.userData.rig, S=this.S;
     if(this.dead){
       this.deadT+=dt;
@@ -1150,16 +1172,21 @@ class Enemy {
     /* walk */
     const vis = inFront(g.position);
     if(!vis){
-      /* outside the view cone: it can't hurt you, so it circles back into it
-         instead of parking at your back and stalling the wave */
+      /* Outside the cone it can't hurt you, so it circles back into view rather
+         than parking at your back and stalling the wave. It orbits at a stand-off
+         radius — a zombie circling at 2m sweeps bearing as v/r and whips the camera. */
       camForward(_fw); camPos(_cp);
-      const right = new THREE.Vector3(-_fw.z, 0, _fw.x);
-      const tgt = _cp.clone()
-        .addScaledVector(_fw, Math.max(5.5, Math.min(dist, 16)))
-        .addScaledVector(right, 3.4*this.flankSide);
-      const fa = Math.atan2(tgt.x-g.position.x, tgt.z-g.position.z);
-      g.rotation.y = fa;
-      this.approach(dt, fa, S.speed*1.25);
+      const rad = new THREE.Vector3(g.position.x-_cp.x, 0, g.position.z-_cp.z);
+      const orb = Math.max(.5, rad.length());
+      rad.divideScalar(orb);
+      const tan = new THREE.Vector3(-rad.z, 0, rad.x);
+      if(tan.dot(_fw) < 0) tan.negate();          /* always circle toward the front */
+      const desired = tan.addScaledVector(rad, (ORBIT_R - orb)*.3);
+      if(desired.lengthSq() < 1e-6) desired.copy(tan);
+      desired.normalize();
+      g.rotation.y = Math.atan2(desired.x, desired.z);
+      g.position.x += desired.x*S.speed*1.2*dt;
+      g.position.z += desired.z*S.speed*1.2*dt;
       const sw2 = Math.sin(this.phase*S.speed*3.4);
       r.lL.rotation.x = sw2*.7; r.lR.rotation.x = -sw2*.7;
       r.aL.rotation.x = -1.15 + sw2*.2; r.aR.rotation.x = -1.15 - sw2*.2;
@@ -1168,11 +1195,12 @@ class Enemy {
     }
     if(S.ranged){
       this.spitCd -= dt;
-      if(dist > 9.5) this.approach(dt,ang,S.speed);
+      if(dist > S.hold + 1.2) this.approach(dt,ang,S.speed);
+      else if(dist < S.hold - 1.2) this.approach(dt,ang,-S.speed*.7);  /* back off */
       else if(this.spitCd<=0){ this.state='spit'; this.st=0; }
-      else this.approach(dt,ang,S.speed*.25);
+      /* otherwise hold station — it must never creep into the camera */
     } else {
-      if(dist > S.reach) this.approach(dt,ang,S.speed);
+      if(dist > S.hold) this.approach(dt,ang,S.speed);
       else { this.state='wind'; this.st=0; }
     }
     /* wounded ones leave a trail */
@@ -1194,6 +1222,51 @@ class Enemy {
     const g=this.group;
     g.position.x += Math.sin(ang)*sp*dt;
     g.position.z += Math.cos(ang)*sp*dt;
+  }
+  /* Hard floor. Runs at the end of EVERY update in EVERY state, so no code path
+     — melee, orbit, spit, knockback — can push a body into the camera. */
+  enforceStandoff(){
+    const g = this.group;
+    let dx = g.position.x - rig.position.x, dz = g.position.z - rig.position.z;
+    let d = Math.hypot(dx,dz);
+    if(d >= MIN_STANDOFF) return;
+    if(d < 1e-4){                       /* exactly coincident: shove out along facing */
+      dx = Math.sin(g.rotation.y+Math.PI); dz = Math.cos(g.rotation.y+Math.PI); d = 1;
+    }
+    const k = MIN_STANDOFF / d;
+    g.position.x = rig.position.x + dx*k;
+    g.position.z = rig.position.z + dz*k;
+  }
+  /* Cap how fast this body may sweep across the view. Tangential speed is
+     limited to MAX_BEARING * radius, so bearing rate stays bounded at any range. */
+  capBearing(prevX, prevZ, dt){
+    if(dt <= 0) return;
+    const g = this.group;
+    const px = prevX - rig.position.x, pz = prevZ - rig.position.z;
+    const nx = g.position.x - rig.position.x, nz = g.position.z - rig.position.z;
+    const a0 = Math.atan2(px,pz), a1 = Math.atan2(nx,nz);
+    let da = wrapPi(a1-a0);
+    const max = MAX_BEARING*dt;
+    if(Math.abs(da) <= max) return;
+    const a = a0 + Math.sign(da)*max;
+    const r = Math.hypot(nx,nz);
+    g.position.x = rig.position.x + Math.sin(a)*r;
+    g.position.z = rig.position.z + Math.cos(a)*r;
+  }
+  /* keep bodies from stacking — coincident enemies make the aim target jitter */
+  separate(dt){
+    const g = this.group;
+    for(let i=0;i<G.enemies.length;i++){
+      const o = G.enemies[i];
+      if(o===this || o.dead) continue;
+      const dx = g.position.x-o.group.position.x, dz = g.position.z-o.group.position.z;
+      const d2 = dx*dx+dz*dz;
+      if(d2 > SEPARATION*SEPARATION || d2 < 1e-6) continue;
+      const d = Math.sqrt(d2);
+      const push = (SEPARATION-d)*2.2*dt;
+      g.position.x += (dx/d)*push;
+      g.position.z += (dz/d)*push;
+    }
   }
   remove(){
     if(this.fadeMats){ this.fadeMats.forEach(m=>m.dispose()); this.fadeMats=null; }
@@ -1945,11 +2018,13 @@ function loadStage(i){
   scene.fog = new THREE.Fog(S.fog, S.near, S.far);
   scene.background = new THREE.Color(S.fog);
   A.ambience(S.ambNoise);
-  /* place player */
+  /* place player — set yaw directly; rig.lookAt() would face it backwards */
   const p0 = G.curve.getPointAt(0);
   rig.position.copy(p0);
   const look = G.curve.getPointAt(0.02);
-  rig.lookAt(look.x, p0.y, look.z);
+  G.yaw = Math.atan2(-(look.x-p0.x), -(look.z-p0.z));
+  rig.rotation.set(0, G.yaw, 0);
+  G.aimTarget = null; G.aimHold = 0;
   G.beats = buildBeats(S); G.bi = -1; G.beat=null;
   G.ammo = MAG; G.reloading=false; paintAmmo(); paintHP();
   D.stageTag.textContent = S.tag;
@@ -2041,7 +2116,68 @@ function bindInput(){
 function moveXH(x,y){ D.xh.style.left=x+'px'; D.xh.style.top=y+'px'; }
 
 /* ================================================================
-   17. LOOP
+   17. CAMERA HEADING
+   rig is a Group, not a camera: Object3D.lookAt() aims +Z at the target
+   for plain objects and only aims -Z for cameras. The child camera looks
+   down -Z, so lookAt() on the rig points it 180 degrees wrong. Drive yaw
+   directly instead, and rate-limit it so nothing can whip the view around.
+================================================================ */
+const YAW_RATE_MOVE = 1.1;      /* rad/s while travelling the rail */
+const YAW_RATE_FAR  = 1.25;     /* rad/s re-acquiring a distant target */
+const YAW_RATE_NEAR = 0.75;     /* rad/s when it's at the stand-off ring */
+const MAX_OFF_RAIL  = 1.15;     /* never stray more than ~66 deg off the rail */
+/* Enemy bearing rate is hard-capped at MAX_BEARING, so YAW_RATE_NEAR only has to
+   exceed that to track perfectly. Blend smoothly with distance — a hard threshold
+   put a rate discontinuity right where enemies hold station. */
+function yawRateFor(d){
+  const k = clamp01((d - MIN_STANDOFF) / 7.0);
+  const s = k*k*(3-2*k);
+  return YAW_RATE_NEAR + (YAW_RATE_FAR-YAW_RATE_NEAR)*s;
+}
+function deadzoneFor(d){
+  const k = clamp01((d - MIN_STANDOFF) / 7.0);
+  return .10 + (.04-.10)*k;
+}
+function clamp01(v){ return v<0?0:(v>1?1:v); }
+function wrapPi(d){ while(d>Math.PI)d-=Math.PI*2; while(d<-Math.PI)d+=Math.PI*2; return d; }
+/* yaw that puts the CAMERA's -Z on (x,z) */
+function yawTo(x,z){ return Math.atan2(-(x-rig.position.x), -(z-rig.position.z)); }
+function clampToward(base, want, maxOff){
+  const d = wrapPi(want-base);
+  return base + Math.max(-maxOff, Math.min(maxOff, d));
+}
+function stepYaw(want, dt, rate, dead){
+  let d = wrapPi(want - G.yaw);
+  if(Math.abs(d) < (dead||0.02)) return;
+  d -= Math.sign(d)*(dead||0.02);
+  const max = rate*dt;
+  if(d >  max) d =  max;
+  if(d < -max) d = -max;
+  G.yaw += d;
+  rig.rotation.set(0, G.yaw, 0);
+}
+/* one stable target, held for a beat so the view can't flick between zombies */
+function pickAimTarget(dt){
+  const cur = G.aimTarget;
+  if(cur && !cur.dead && cur.group.parent){
+    G.aimHold -= dt;
+    if(G.aimHold > 0) return cur;
+  }
+  let best=null, bestScore=Infinity;
+  for(let i=0;i<G.enemies.length;i++){
+    const e = G.enemies[i];
+    if(e.dead) continue;
+    const d = e.group.position.distanceTo(rig.position);
+    const c = coneDot(e.group.position);
+    const score = d * (1.7 - c.d);       /* close AND already centred wins */
+    if(score < bestScore){ bestScore = score; best = e; }
+  }
+  if(best !== G.aimTarget){ G.aimTarget = best; G.aimHold = 1.2; }
+  return best;
+}
+
+/* ================================================================
+   18. LOOP
 ================================================================ */
 const _q = new THREE.Quaternion(), _e = new THREE.Euler(), _tmp = new THREE.Vector3();
 function tick(){
@@ -2050,25 +2186,25 @@ function tick(){
     updateBeat(dt);
     /* rail transform */
     if(G.curve){
-      const p = G.curve.getPointAt(Math.max(0,Math.min(1,G.railT)));
+      const p = G.curve.getPointAt(clamp01(G.railT));
       rig.position.lerp(p, Math.min(1, dt*9));
-      let lookAtP;
-      if(G.moving){
-        lookAtP = G.curve.getPointAt(Math.max(0,Math.min(1,G.railT+0.03)));
-      } else if(G.boss && G.boss.group){
-        lookAtP = G.boss.group.position.clone().setY(EYE+1.0);
-      } else if(G.enemies.length){
-        _tmp.set(0,0,0);
-        let n=0;
-        G.enemies.forEach(e=>{ if(!e.dead){ _tmp.add(e.group.position); n++; } });
-        lookAtP = n? _tmp.divideScalar(n).setY(EYE) : G.curve.getPointAt(Math.min(1,G.railT+.03));
-      } else {
-        lookAtP = G.curve.getPointAt(Math.max(0,Math.min(1,G.railT+0.03)));
+      const ahead = G.curve.getPointAt(clamp01(G.railT+0.03));
+      const railYaw = yawTo(ahead.x, ahead.z);
+      let wantYaw = railYaw, rate = YAW_RATE_MOVE, dead = .02;
+      if(!G.moving){
+        let tp = null;
+        if(G.boss && G.boss.group && !G.boss.downed) tp = G.boss.group.position;
+        else { const e = pickAimTarget(dt); if(e) tp = e.group.position; }
+        if(tp){
+          const td = Math.hypot(tp.x-rig.position.x, tp.z-rig.position.z);
+          if(td > MIN_STANDOFF*.6){        /* below this the bearing is meaningless */
+            wantYaw = clampToward(railYaw, yawTo(tp.x, tp.z), MAX_OFF_RAIL);
+            rate = yawRateFor(td);
+            dead = deadzoneFor(td);
+          }
+        }
       }
-      const cur = rig.quaternion.clone();
-      rig.lookAt(lookAtP.x, rig.position.y, lookAtP.z);
-      const want = rig.quaternion.clone();
-      rig.quaternion.copy(cur).slerp(want, Math.min(1, dt*(G.moving?1.6:2.4)));
+      stepYaw(wantYaw, dt, rate, dead);
     }
     /* entities */
     for(let i=G.enemies.length-1;i>=0;i--) G.enemies[i].update(dt);
